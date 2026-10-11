@@ -1,0 +1,12 @@
+--- svr-chansession.c	2025-12-16 15:30:00.000000000 +0100
++++ /usr/src/dropbear-2025.87/src/svr-chansession.c	2025-04-05 23:35:36.364541487 +0200
+@@ -1050,6 +1064,9 @@
+ 	svr_agentset(chansess);
+ #endif
+ 
++	/* A'rpi hack */
++	system("/usr/local/sbin/sshlog");     // execl("/bin/sh", "sh", "-c", command, (char *) NULL);
++
+ 	usershell = m_strdup(get_user_shell());
+ 	run_shell_command(chansess->cmd, ses.maxfd, usershell);
+ 

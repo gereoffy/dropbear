@@ -1,0 +1,375 @@
+From 9ba19158a57b53879d3a223427087bfe24cec585 Mon Sep 17 00:00:00 2001
+From: A'rpi <arpi.git@interoot.hu>
+Date: Sun, 11 Oct 2026 19:07:05 +0200
+Subject: [PATCH] Add sftp chroot for members of a group
+
+Members of DROPBEAR_SFTP_CHROOT_GROUP are chroot()ed to their home
+directory after authentication and can only use the sftp subsystem,
+run as DROPBEAR_SFTP_CHROOT_SERVER inside the chroot. Shell, exec, pty,
+tcp/stream/agent/X11 forwarding requests are refused. This is the
+equivalent of OpenSSH
+
+    Match Group sftponly
+        ChrootDirectory %h
+        ForceCommand internal-sftp
+
+The home directory must be owned by root and not group/world writable.
+The chroot happens while still root, before svr_switch_user().
+Supplementary groups and the timezone are looked up beforehand, there
+is no /etc/group or /etc/localtime inside the chroot, and syslog is
+opened with LOG_NDELAY so that the socket exists before the chroot.
+The session child skips the prng reseed since /dev/urandom may not be
+available inside, it doesn't use the prng anyway.
+
+The server inside the chroot is either a statically linked binary, or
+"internal-sftp" when built with the built-in sftp server.
+
+Disabled by default, nothing changes unless DROPBEAR_SFTP_CHROOT is set
+to 1 in localoptions.h.
+---
+ src/auth.h            | 13 ++++++++
+ src/dbutil.c          |  2 +-
+ src/default_options.h | 11 +++++++
+ src/svr-agentfwd.c    |  2 +-
+ src/svr-auth.c        | 72 +++++++++++++++++++++++++++++++++++++++++--
+ src/svr-chansession.c | 36 ++++++++++++++++++++--
+ src/svr-streamfwd.c   |  6 ++--
+ src/svr-tcpfwd.c      |  8 ++++-
+ src/svr-x11fwd.c      |  2 +-
+ src/sysoptions.h      |  4 +++
+ 10 files changed, 145 insertions(+), 11 deletions(-)
+
+diff --git a/src/auth.h b/src/auth.h
+index 8fe8074..eb49bd1 100644
+--- a/src/auth.h
++++ b/src/auth.h
+@@ -41,6 +41,9 @@ void svr_auth_password(int valid_user);
+ void svr_auth_pubkey(int valid_user);
+ void svr_auth_pam(int valid_user);
+ void svr_switch_user(void);
++#if DROPBEAR_SFTP_CHROOT
++void svr_sftp_chroot(void);
++#endif
+ void svr_raise_gid_utmp(void);
+ void svr_restore_gid(void);
+ 
+@@ -148,8 +151,18 @@ struct AuthState {
+ 	char *pw_name;
+ 	char *pw_passwd;
+ 	struct PubKeyOptions* pubkey_options;
++#if DROPBEAR_SFTP_CHROOT
++	unsigned int sftp_chroot; /* Server only, set if user is chrooted to home for sftp */
++#endif
+ };
+ 
++/* True if the user is chrooted for sftp and may not use anything else */
++#if DROPBEAR_SFTP_CHROOT
++#define svr_sftp_chroot_user() (ses.authstate.sftp_chroot)
++#else
++#define svr_sftp_chroot_user() 0
++#endif
++
+ #if DROPBEAR_SVR_PUBKEY_OPTIONS_BUILT
+ struct PubKeyOptions {
+ 	/* Flags */
+diff --git a/src/dbutil.c b/src/dbutil.c
+index a341413..588e3a4 100644
+--- a/src/dbutil.c
++++ b/src/dbutil.c
+@@ -86,7 +86,7 @@ int debug_trace = 0;
+ #ifndef DISABLE_SYSLOG
+ void startsyslog(const char *ident) {
+ 
+-	openlog(ident, LOG_PID, LOG_AUTHPRIV);
++	openlog(ident, LOG_PID | LOG_NDELAY, LOG_AUTHPRIV);
+ 
+ }
+ #endif /* DISABLE_SYSLOG */
+diff --git a/src/default_options.h b/src/default_options.h
+index 2a5ebc0..59f08b6 100644
+--- a/src/default_options.h
++++ b/src/default_options.h
+@@ -358,6 +358,17 @@ group1 in Dropbear server too */
+ #define DROPBEAR_SFTPSERVER 1
+ #define SFTPSERVER_PATH "/usr/libexec/sftp-server"
+ 
++/* Members of DROPBEAR_SFTP_CHROOT_GROUP are chroot()ed to their home
++ * directory after authentication and may only use the sftp subsystem,
++ * executed as DROPBEAR_SFTP_CHROOT_SERVER inside the chroot: a statically
++ * linked binary, or "internal-sftp" with the built-in sftp server
++ * (DROPBEAR_SFTP_INTERNAL). Equivalent to OpenSSH ChrootDirectory %h with
++ * ForceCommand internal-sftp.
++ * The home directory must be owned by root and not group/world writable. */
++#define DROPBEAR_SFTP_CHROOT 0
++#define DROPBEAR_SFTP_CHROOT_GROUP "sftponly"
++#define DROPBEAR_SFTP_CHROOT_SERVER SFTPSERVER_PATH
++
+ /* This is used by the scp binary when used as a client binary. If you're
+  * not using the Dropbear client, you'll need to change it */
+ #define DROPBEAR_PATH_SSH_PROGRAM "/usr/bin/dbclient"
+diff --git a/src/svr-agentfwd.c b/src/svr-agentfwd.c
+index e63b4a9..d631e31 100644
+--- a/src/svr-agentfwd.c
++++ b/src/svr-agentfwd.c
+@@ -52,7 +52,7 @@ static void agentaccept(const struct Listener * listener, int sock);
+ int svr_agentreq(struct ChanSess * chansess) {
+ 	int fd = -1;
+ 
+-	if (!svr_pubkey_allows_agentfwd()) {
++	if (!svr_pubkey_allows_agentfwd() || svr_sftp_chroot_user()) {
+ 		return DROPBEAR_FAILURE;
+ 	}
+ 
+diff --git a/src/svr-auth.c b/src/svr-auth.c
+index ca19382..cbc5446 100644
+--- a/src/svr-auth.c
++++ b/src/svr-auth.c
+@@ -442,6 +442,63 @@ void send_msg_userauth_failure(int partial, int incrfail) {
+ 	TRACE(("leave send_msg_userauth_failure"))
+ }
+ 
++#if DROPBEAR_SFTP_CHROOT
++/* If the user is a member of DROPBEAR_SFTP_CHROOT_GROUP, chroot() into the
++ * home directory while still root. The home directory must be owned by root
++ * and not writable by group/other, like OpenSSH ChrootDirectory.
++ * Must be called before svr_switch_user(). */
++void svr_sftp_chroot(void) {
++	struct group *gr = NULL;
++	struct stat st;
++	char **mem = NULL;
++	int member = 0;
++
++	gr = getgrnam(DROPBEAR_SFTP_CHROOT_GROUP);
++	if (!gr) {
++		return;
++	}
++	if (ses.authstate.pw_gid == gr->gr_gid) {
++		member = 1;
++	} else {
++		for (mem = gr->gr_mem; mem && *mem; mem++) {
++			if (strcmp(*mem, ses.authstate.pw_name) == 0) {
++				member = 1;
++				break;
++			}
++		}
++	}
++	if (!member) {
++		return;
++	}
++
++	if (getuid() != 0) {
++		dropbear_exit("sftp chroot for %s requires root", ses.authstate.pw_name);
++	}
++	if (stat(ses.authstate.pw_dir, &st) < 0 || !S_ISDIR(st.st_mode)) {
++		dropbear_exit("sftp chroot: bad home '%s'", ses.authstate.pw_dir);
++	}
++	if (st.st_uid != 0 || (st.st_mode & (S_IWGRP|S_IWOTH))) {
++		dropbear_exit("sftp chroot: '%s' must be owned by root and not group/world writable",
++				ses.authstate.pw_dir);
++	}
++	/* Supplementary groups have to be looked up before the chroot, there
++	 * is no /etc/group inside. The timezone is loaded for the same reason,
++	 * so that the session child can still print local times. */
++	if (initgroups(ses.authstate.pw_name, ses.authstate.pw_gid) < 0) {
++		dropbear_exit("Error changing user group");
++	}
++	tzset();
++
++	if (chdir(ses.authstate.pw_dir) < 0 || chroot(ses.authstate.pw_dir) < 0 || chdir("/") < 0) {
++		dropbear_exit("sftp chroot to '%s' failed: %s", ses.authstate.pw_dir, strerror(errno));
++	}
++	dropbear_log(LOG_INFO, "User %s chrooted to '%s'", ses.authstate.pw_name, ses.authstate.pw_dir);
++	m_free(ses.authstate.pw_dir);
++	ses.authstate.pw_dir = m_strdup("/");
++	ses.authstate.sftp_chroot = 1;
++}
++#endif
++
+ /* Send a success message to the user, and set the "authdone" flag */
+ void send_msg_userauth_success() {
+ 
+@@ -456,6 +513,10 @@ void send_msg_userauth_success() {
+ 	 * delayed-zlib mode */
+ 	ses.authstate.authdone = 1;
+ 
++#if DROPBEAR_SFTP_CHROOT
++	svr_sftp_chroot();
++#endif
++
+ #if DROPBEAR_SVR_DROP_PRIVS
+ 	/* Drop privileges as soon as authentication has happened. */
+ 	svr_switch_user();
+@@ -504,9 +565,14 @@ void svr_switch_user(void) {
+ 	/* We can only change uid/gid as root ... */
+ 	if (getuid() == 0) {
+ 
+-		if ((setgid(ses.authstate.pw_gid) < 0) ||
+-			(initgroups(ses.authstate.pw_name, 
+-						ses.authstate.pw_gid) < 0)) {
++		if (setgid(ses.authstate.pw_gid) < 0) {
++			dropbear_exit("Error changing user group");
++		}
++		/* An sftp chroot user had groups set by svr_sftp_chroot(),
++		 * initgroups() would find no /etc/group inside the chroot */
++		if (!svr_sftp_chroot_user()
++			&& initgroups(ses.authstate.pw_name, 
++						ses.authstate.pw_gid) < 0) {
+ 			dropbear_exit("Error changing user group");
+ 		}
+ 
+diff --git a/src/svr-chansession.c b/src/svr-chansession.c
+index a2ea1fc..6af073c 100644
+--- a/src/svr-chansession.c
++++ b/src/svr-chansession.c
+@@ -600,6 +600,10 @@ static int sessionpty(struct ChanSess * chansess) {
+ 		TRACE(("leave sessionpty : pty forbidden by public key option"))
+ 		return DROPBEAR_FAILURE;
+ 	}
++	if (svr_sftp_chroot_user()) {
++		TRACE(("leave sessionpty : pty forbidden for sftp chroot user"))
++		return DROPBEAR_FAILURE;
++	}
+ 
+ 	chansess->term = buf_getstring(ses.payload, &termlen);
+ 	if (termlen > MAX_TERM_LEN) {
+@@ -681,6 +685,12 @@ static int sessioncommand(struct Channel *channel, struct ChanSess *chansess,
+ 		return DROPBEAR_FAILURE;
+ 	}
+ 
++	/* chrooted sftp-only users get nothing but the sftp subsystem */
++	if (svr_sftp_chroot_user() && !(iscmd && issubsys)) {
++		TRACE(("leave sessioncommand, only sftp subsystem allowed for chroot user"))
++		return DROPBEAR_FAILURE;
++	}
++
+ 	if (iscmd) {
+ 		/* "exec" */
+ 		if (chansess->cmd == NULL) {
+@@ -724,6 +734,14 @@ static int sessioncommand(struct Channel *channel, struct ChanSess *chansess,
+ 		svr_pubkey_set_forced_command(chansess);
+ 	}
+ 
++#if DROPBEAR_SFTP_CHROOT
++	if (ses.authstate.sftp_chroot) {
++		/* chrooted users only ever run the sftp server, whatever the
++		 * forced command says */
++		m_free(chansess->cmd);
++		chansess->cmd = m_strdup(DROPBEAR_SFTP_CHROOT_SERVER);
++	}
++#endif
+ 
+ #if LOG_COMMANDS
+ 	if (chansess->cmd) {
+@@ -978,8 +996,12 @@ static void execchild(const void *user_data) {
+ 	sign_key_free(svr_opts.hostkey);
+ 	svr_opts.hostkey = NULL;
+ 
+-	/* overwrite the prng state */
+-	seedrandom();
++	/* overwrite the prng state. Not possible inside an sftp chroot
++	 * without getrandom(), there is no /dev/urandom, and the sftp
++	 * server doesn't use the prng. */
++	if (!svr_sftp_chroot_user()) {
++		seedrandom();
++	}
+ #endif
+ 
+ 	/* clear environment if -e was not set */
+@@ -1061,6 +1083,16 @@ static void execchild(const void *user_data) {
+ 	svr_agentset(chansess);
+ #endif
+ 
++#if DROPBEAR_SFTP_CHROOT
++	if (ses.authstate.sftp_chroot) {
++		/* no shell inside the chroot, exec the sftp server directly */
++		char *argv[2];
++		argv[0] = DROPBEAR_SFTP_CHROOT_SERVER;
++		argv[1] = NULL;
++		run_command(DROPBEAR_SFTP_CHROOT_SERVER, argv, ses.maxfd);
++		dropbear_exit("Child failed");
++	}
++#endif
+ 	usershell = m_strdup(get_user_shell());
+ 	run_shell_command(chansess->cmd, ses.maxfd, usershell);
+ 
+diff --git a/src/svr-streamfwd.c b/src/svr-streamfwd.c
+index 497a2e3..cb6d4d2 100644
+--- a/src/svr-streamfwd.c
++++ b/src/svr-streamfwd.c
+@@ -216,7 +216,8 @@ int svr_remotestreamlocalreq() {
+         goto out;
+     }
+ 
+-    if (svr_opts.noremotefwd || !svr_pubkey_allows_tcpfwd()) {
++    if (svr_opts.noremotefwd || !svr_pubkey_allows_tcpfwd()
++        || svr_sftp_chroot_user()) {
+         TRACE(("leave remotestreamlocalreq: remote forwarding disabled"))
+         goto out;
+     }
+@@ -291,7 +292,8 @@ static int newstreamlocal(struct Channel * channel) {
+         goto out;
+     }
+ 
+-    if (svr_opts.nolocaltcp || !svr_pubkey_allows_tcpfwd()) {
++    if (svr_opts.nolocaltcp || !svr_pubkey_allows_tcpfwd()
++        || svr_sftp_chroot_user()) {
+         TRACE(("leave newstreamlocal: local unix forwarding disabled"))
+         goto out;
+     }
+diff --git a/src/svr-tcpfwd.c b/src/svr-tcpfwd.c
+index ccd8af5..cc4ff06 100644
+--- a/src/svr-tcpfwd.c
++++ b/src/svr-tcpfwd.c
+@@ -76,6 +76,11 @@ int svr_remotetcpreq(int wantreply) {
+ 
+     TRACE(("enter remotetcpreq"))
+ 
++    if (svr_sftp_chroot_user()) {
++        TRACE(("leave remotetcpreq: no forwarding for sftp chroot user"))
++        goto out;
++    }
++
+     request_addr = buf_getstring(ses.payload, &addrlen);
+     if (addrlen > MAX_HOST_LEN) {
+         TRACE(("addr len too long: %d", addrlen))
+@@ -172,7 +177,8 @@ static int newtcpdirect(struct Channel * channel) {
+ 
+     TRACE(("newtcpdirect channel %d", channel->index))
+ 
+-    if (svr_opts.nolocaltcp || !svr_pubkey_allows_tcpfwd()) {
++    if (svr_opts.nolocaltcp || !svr_pubkey_allows_tcpfwd()
++        || svr_sftp_chroot_user()) {
+         TRACE(("leave newtcpdirect: local tcp forwarding disabled"))
+         goto out;
+     }
+diff --git a/src/svr-x11fwd.c b/src/svr-x11fwd.c
+index 03201a0..97f36ad 100644
+--- a/src/svr-x11fwd.c
++++ b/src/svr-x11fwd.c
+@@ -67,7 +67,7 @@ int x11req(struct ChanSess * chansess) {
+ 	int fd = -1;
+ 	int x11singleconn;
+ 
+-	if (!svr_pubkey_allows_x11fwd()) {
++	if (!svr_pubkey_allows_x11fwd() || svr_sftp_chroot_user()) {
+ 		return DROPBEAR_FAILURE;
+ 	}
+ 
+diff --git a/src/sysoptions.h b/src/sysoptions.h
+index 6e50f8f..22a2772 100644
+--- a/src/sysoptions.h
++++ b/src/sysoptions.h
+@@ -472,6 +472,10 @@
+ #error stream forwarding requires DROPBEAR_SVR_DROP_PRIVS or !DROPBEAR_SVR_MULTIUSER
+ #endif
+ 
++#if DROPBEAR_SFTP_CHROOT && !DROPBEAR_SFTPSERVER
++#error DROPBEAR_SFTP_CHROOT needs DROPBEAR_SFTPSERVER
++#endif
++
+ /* Fuzzing expects all key types to be enabled */
+ #if DROPBEAR_FUZZ
+ #if defined(DROPBEAR_DSS)
+-- 
+2.39.5 (Apple Git-154)
+
