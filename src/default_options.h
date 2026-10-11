@@ -349,6 +349,11 @@ group1 in Dropbear server too */
  * "-q" for quiet */
 #define XAUTH_COMMAND "/usr/bin/xauth -q"
 
+/* Built-in minimal SFTP v3 server, like OpenSSH internal-sftp. A command
+ * of exactly "internal-sftp" (SFTPSERVER_PATH, a forced command, or
+ * DROPBEAR_SFTP_CHROOT_SERVER) runs it inside dropbear instead of executing
+ * a program. Needs fork(), not usable with DROPBEAR_VFORK. */
+#define DROPBEAR_SFTP_INTERNAL 0
 
 /* If you want to enable running an sftp server (such as the one included with
  * OpenSSH), set the path below and set DROPBEAR_SFTPSERVER.

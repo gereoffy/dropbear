@@ -37,6 +37,7 @@
 #include "agentfwd.h"
 #include "runopts.h"
 #include "auth.h"
+#include "svr-sftp.h"
 
 /* Handles sessions (either shells or programs) requested by the client */
 
@@ -1050,6 +1051,13 @@ static void execchild(const void *user_data) {
 		}
 		fprintf(stderr, "Failed chdir '%s': %s\n", ses.authstate.pw_dir, strerror(e));
 	}
+
+#if DROPBEAR_SFTP_INTERNAL
+	if (chansess->cmd && strcmp(chansess->cmd, SFTP_INTERNAL_NAME) == 0) {
+		/* doesn't return */
+		svr_sftp_internal();
+	}
+#endif
 
 
 #if DROPBEAR_X11FWD

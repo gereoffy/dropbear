@@ -1,0 +1,1390 @@
+/*
+ * Dropbear SSH
+ *
+ * Minimal built-in SFTP server (protocol version 3), the equivalent of
+ * OpenSSH "internal-sftp". It runs in the forked session child, after
+ * privileges have been dropped (and after chroot() for sftp chroot users),
+ * so it needs no binary, libraries or device nodes inside the chroot.
+ *
+ * Only plain libc is used here, so the protocol code can also be built
+ * standalone for testing:
+ *   cc -DSFTP_STANDALONE -o sftp-test svr-sftp.c
+ *   sftp -D ./sftp-test
+ *
+ * Protocol: draft-ietf-secsh-filexfer-02 plus the OpenSSH extensions
+ * posix-rename, statvfs, fstatvfs, hardlink, fsync and limits.
+ */
+
+#ifdef SFTP_STANDALONE
+
+#define _FILE_OFFSET_BITS 64
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/time.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <syslog.h>
+#include <time.h>
+#include <unistd.h>
+#include "svr-sftp.h"
+
+#define SFTP_LOG_OPS 1
+
+static void sftp_log(int priority, const char *format, ...) {
+	va_list param;
+	(void)priority;
+	va_start(param, format);
+	vfprintf(stderr, format, param);
+	va_end(param);
+	fputc('\n', stderr);
+}
+
+int main(void) {
+	return sftp_server_main(STDIN_FILENO, STDOUT_FILENO, "test");
+}
+
+#else /* !SFTP_STANDALONE */
+
+#include "includes.h"
+#include "dbutil.h"
+#include "session.h"
+#include "runopts.h"
+#include "svr-sftp.h"
+
+#if DROPBEAR_SFTP_INTERNAL
+#define SFTP_LOG_OPS LOG_COMMANDS
+
+/* Only log to syslog: stderr of the session child is the client's channel */
+static void sftp_log(int priority, const char *format, ...) {
+#ifndef DISABLE_SYSLOG
+	va_list param;
+	if (!opts.usingsyslog) {
+		return;
+	}
+	va_start(param, format);
+	_dropbear_log(priority, format, param);
+	va_end(param);
+#else
+	(void)priority;
+	(void)format;
+#endif
+}
+#endif
+
+#endif /* SFTP_STANDALONE */
+
+#if defined(SFTP_STANDALONE) || DROPBEAR_SFTP_INTERNAL
+
+#include <sys/statvfs.h>
+
+/* packet types */
+#define SSH_FXP_INIT		1
+#define SSH_FXP_VERSION		2
+#define SSH_FXP_OPEN		3
+#define SSH_FXP_CLOSE		4
+#define SSH_FXP_READ		5
+#define SSH_FXP_WRITE		6
+#define SSH_FXP_LSTAT		7
+#define SSH_FXP_FSTAT		8
+#define SSH_FXP_SETSTAT		9
+#define SSH_FXP_FSETSTAT	10
+#define SSH_FXP_OPENDIR		11
+#define SSH_FXP_READDIR		12
+#define SSH_FXP_REMOVE		13
+#define SSH_FXP_MKDIR		14
+#define SSH_FXP_RMDIR		15
+#define SSH_FXP_REALPATH	16
+#define SSH_FXP_STAT		17
+#define SSH_FXP_RENAME		18
+#define SSH_FXP_READLINK	19
+#define SSH_FXP_SYMLINK		20
+#define SSH_FXP_STATUS		101
+#define SSH_FXP_HANDLE		102
+#define SSH_FXP_DATA		103
+#define SSH_FXP_NAME		104
+#define SSH_FXP_ATTRS		105
+#define SSH_FXP_EXTENDED	200
+#define SSH_FXP_EXTENDED_REPLY	201
+
+/* status codes */
+#define SSH_FX_OK			0
+#define SSH_FX_EOF			1
+#define SSH_FX_NO_SUCH_FILE		2
+#define SSH_FX_PERMISSION_DENIED	3
+#define SSH_FX_FAILURE			4
+#define SSH_FX_BAD_MESSAGE		5
+#define SSH_FX_OP_UNSUPPORTED		8
+
+/* attribute flags */
+#define SSH_FILEXFER_ATTR_SIZE		0x00000001
+#define SSH_FILEXFER_ATTR_UIDGID	0x00000002
+#define SSH_FILEXFER_ATTR_PERMISSIONS	0x00000004
+#define SSH_FILEXFER_ATTR_ACMODTIME	0x00000008
+#define SSH_FILEXFER_ATTR_EXTENDED	0x80000000
+
+/* open flags */
+#define SSH_FXF_READ	0x00000001
+#define SSH_FXF_WRITE	0x00000002
+#define SSH_FXF_APPEND	0x00000004
+#define SSH_FXF_CREAT	0x00000008
+#define SSH_FXF_TRUNC	0x00000010
+#define SSH_FXF_EXCL	0x00000020
+
+/* statvfs@openssh.com f_flag */
+#define SSH2_FXE_STATVFS_ST_RDONLY	0x00000001
+#define SSH2_FXE_STATVFS_ST_NOSUID	0x00000002
+
+#define SFTP_VERSION		3
+#define SFTP_MAX_MSG_LEN	(256 * 1024)
+#define SFTP_MAX_RW_LEN		(SFTP_MAX_MSG_LEN - 1024)
+#define SFTP_MAX_HANDLES	256
+#define SFTP_READDIR_BATCH	100
+/* permission bits a client may set; no setuid/setgid */
+#define SFTP_MODE_MASK		(S_IRWXU | S_IRWXG | S_IRWXO | S_ISVTX)
+
+struct sftp_in {
+	const unsigned char *data;
+	uint32_t len;
+	uint32_t pos;
+	int bad;
+};
+
+struct sftp_out {
+	unsigned char *data;
+	size_t len;
+	size_t size;
+};
+
+struct sftp_attrs {
+	uint32_t flags;
+	uint64_t size;
+	uint32_t uid;
+	uint32_t gid;
+	uint32_t perm;
+	uint32_t atime;
+	uint32_t mtime;
+};
+
+enum { HANDLE_UNUSED = 0, HANDLE_FILE, HANDLE_DIR };
+
+struct sftp_handle {
+	int type;
+	int fd;
+	int append; /* opened with O_APPEND, writes ignore the offset */
+	DIR *dir;
+	char *path;
+	uint64_t bytes_read;
+	uint64_t bytes_write;
+};
+
+static struct sftp_handle handles[SFTP_MAX_HANDLES];
+static struct sftp_out out;
+static int sftp_outfd = -1;
+static const char *sftp_user = "";
+static uint64_t total_read, total_write;
+
+/* --- helpers --- */
+
+static void sftp_exit(int code) {
+	sftp_log(LOG_INFO, "sftp session closed for user %s: read %llu bytes, wrote %llu bytes",
+			sftp_user, (unsigned long long)total_read, (unsigned long long)total_write);
+	_exit(code);
+}
+
+static void fatal(const char *msg) {
+	sftp_log(LOG_WARNING, "sftp user %s: %s", sftp_user, msg);
+	sftp_exit(1);
+}
+
+#if SFTP_LOG_OPS
+/* copy of a path suitable for logging: printable ASCII only */
+static const char *logpath(const char *path) {
+	static char buf[256];
+	size_t i;
+	for (i = 0; path[i] && i < sizeof(buf) - 1; i++) {
+		unsigned char c = (unsigned char)path[i];
+		buf[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+	}
+	buf[i] = '\0';
+	return buf;
+}
+#endif
+
+/* --- input parsing; on malformed input 'bad' is set and zero/NULL returned --- */
+
+static uint32_t get_u8(struct sftp_in *in) {
+	if (in->bad || in->len - in->pos < 1) {
+		in->bad = 1;
+		return 0;
+	}
+	return in->data[in->pos++];
+}
+
+static uint32_t get_u32(struct sftp_in *in) {
+	const unsigned char *p;
+	if (in->bad || in->len - in->pos < 4) {
+		in->bad = 1;
+		return 0;
+	}
+	p = in->data + in->pos;
+	in->pos += 4;
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+		| ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static uint64_t get_u64(struct sftp_in *in) {
+	uint64_t hi = get_u32(in);
+	return (hi << 32) | get_u32(in);
+}
+
+/* returns a pointer into the packet, not NUL terminated */
+static const unsigned char *get_string(struct sftp_in *in, uint32_t *len) {
+	const unsigned char *p;
+	uint32_t l = get_u32(in);
+	if (in->bad || in->len - in->pos < l) {
+		in->bad = 1;
+		*len = 0;
+		return NULL;
+	}
+	p = in->data + in->pos;
+	in->pos += l;
+	*len = l;
+	return p;
+}
+
+/* returns a malloced NUL terminated copy, rejects embedded NULs */
+static char *get_cstring(struct sftp_in *in) {
+	uint32_t len;
+	const unsigned char *p = get_string(in, &len);
+	char *s;
+	if (p == NULL || memchr(p, '\0', len) != NULL) {
+		in->bad = 1;
+		return NULL;
+	}
+	s = malloc((size_t)len + 1);
+	if (s == NULL) {
+		fatal("out of memory");
+	}
+	memcpy(s, p, len);
+	s[len] = '\0';
+	return s;
+}
+
+static void get_attrs(struct sftp_in *in, struct sftp_attrs *a) {
+	memset(a, 0, sizeof(*a));
+	a->flags = get_u32(in);
+	if (a->flags & SSH_FILEXFER_ATTR_SIZE) {
+		a->size = get_u64(in);
+	}
+	if (a->flags & SSH_FILEXFER_ATTR_UIDGID) {
+		a->uid = get_u32(in);
+		a->gid = get_u32(in);
+	}
+	if (a->flags & SSH_FILEXFER_ATTR_PERMISSIONS) {
+		a->perm = get_u32(in);
+	}
+	if (a->flags & SSH_FILEXFER_ATTR_ACMODTIME) {
+		a->atime = get_u32(in);
+		a->mtime = get_u32(in);
+	}
+	if (a->flags & SSH_FILEXFER_ATTR_EXTENDED) {
+		uint32_t i, count = get_u32(in), len;
+		for (i = 0; i < count && !in->bad; i++) {
+			(void)get_string(in, &len); /* type */
+			(void)get_string(in, &len); /* data */
+		}
+	}
+}
+
+/* --- output --- */
+
+static void out_reserve(size_t n) {
+	if (out.size - out.len < n) {
+		size_t newsize = out.size ? out.size : 1024;
+		unsigned char *p;
+		while (newsize - out.len < n) {
+			newsize *= 2;
+		}
+		p = realloc(out.data, newsize);
+		if (p == NULL) {
+			fatal("out of memory");
+		}
+		out.data = p;
+		out.size = newsize;
+	}
+}
+
+static void put_u8(uint32_t v) {
+	out_reserve(1);
+	out.data[out.len++] = (unsigned char)v;
+}
+
+static void put_u32(uint32_t v) {
+	out_reserve(4);
+	out.data[out.len++] = (unsigned char)(v >> 24);
+	out.data[out.len++] = (unsigned char)(v >> 16);
+	out.data[out.len++] = (unsigned char)(v >> 8);
+	out.data[out.len++] = (unsigned char)v;
+}
+
+static void put_u64(uint64_t v) {
+	put_u32((uint32_t)(v >> 32));
+	put_u32((uint32_t)v);
+}
+
+static void put_string(const void *s, uint32_t len) {
+	put_u32(len);
+	out_reserve(len);
+	if (len) {
+		memcpy(out.data + out.len, s, len);
+	}
+	out.len += len;
+}
+
+static void put_cstring(const char *s) {
+	put_string(s, (uint32_t)strlen(s));
+}
+
+static void put_attrs(const struct stat *st) {
+	put_u32(SSH_FILEXFER_ATTR_SIZE | SSH_FILEXFER_ATTR_UIDGID
+			| SSH_FILEXFER_ATTR_PERMISSIONS | SSH_FILEXFER_ATTR_ACMODTIME);
+	put_u64((uint64_t)st->st_size);
+	put_u32((uint32_t)st->st_uid);
+	put_u32((uint32_t)st->st_gid);
+	put_u32((uint32_t)st->st_mode);
+	put_u32((uint32_t)st->st_atime);
+	put_u32((uint32_t)st->st_mtime);
+}
+
+/* start a reply packet; the length is filled in by send_packet() */
+static void begin_packet(uint32_t type, uint32_t id) {
+	out.len = 0;
+	put_u32(0);
+	put_u8(type);
+	put_u32(id);
+}
+
+static void write_all(int fd, const unsigned char *p, size_t len) {
+	while (len > 0) {
+		ssize_t n = write(fd, p, len);
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			sftp_exit(0); /* client gone */
+		}
+		p += n;
+		len -= (size_t)n;
+	}
+}
+
+static void send_packet(void) {
+	uint32_t len = (uint32_t)(out.len - 4);
+	out.data[0] = (unsigned char)(len >> 24);
+	out.data[1] = (unsigned char)(len >> 16);
+	out.data[2] = (unsigned char)(len >> 8);
+	out.data[3] = (unsigned char)len;
+	write_all(sftp_outfd, out.data, out.len);
+}
+
+static void send_status(uint32_t id, uint32_t code, const char *msg) {
+	static const char *const msgs[] = {
+		"Success", "End of file", "No such file", "Permission denied",
+		"Failure", "Bad message", "No connection", "Connection lost",
+		"Operation unsupported"
+	};
+	if (msg == NULL) {
+		msg = code < sizeof(msgs) / sizeof(msgs[0]) ? msgs[code] : "Unknown error";
+	}
+	begin_packet(SSH_FXP_STATUS, id);
+	put_u32(code);
+	put_cstring(msg);
+	put_cstring(""); /* language tag */
+	send_packet();
+}
+
+static void send_errno(uint32_t id, int err) {
+	switch (err) {
+		case 0:
+			send_status(id, SSH_FX_OK, NULL);
+			break;
+		case ENOENT:
+		case ENOTDIR:
+		case EBADF:
+		case ELOOP:
+			send_status(id, SSH_FX_NO_SUCH_FILE, NULL);
+			break;
+		case EPERM:
+		case EACCES:
+		case EFAULT:
+			send_status(id, SSH_FX_PERMISSION_DENIED, NULL);
+			break;
+		case ENAMETOOLONG:
+		case EINVAL:
+			send_status(id, SSH_FX_BAD_MESSAGE, NULL);
+			break;
+		case ENOSYS:
+			send_status(id, SSH_FX_OP_UNSUPPORTED, NULL);
+			break;
+		default:
+			send_status(id, SSH_FX_FAILURE, strerror(err));
+			break;
+	}
+}
+
+/* result of a syscall returning -1 on error */
+static void send_result(uint32_t id, int ret) {
+	send_errno(id, ret < 0 ? errno : 0);
+}
+
+static void send_handle(uint32_t id, uint32_t h) {
+	unsigned char buf[4];
+	buf[0] = (unsigned char)(h >> 24);
+	buf[1] = (unsigned char)(h >> 16);
+	buf[2] = (unsigned char)(h >> 8);
+	buf[3] = (unsigned char)h;
+	begin_packet(SSH_FXP_HANDLE, id);
+	put_string(buf, sizeof(buf));
+	send_packet();
+}
+
+static void send_attrs(uint32_t id, const struct stat *st) {
+	begin_packet(SSH_FXP_ATTRS, id);
+	put_attrs(st);
+	send_packet();
+}
+
+/* NAME reply with a single entry and no attributes */
+static void send_name(uint32_t id, const char *name) {
+	begin_packet(SSH_FXP_NAME, id);
+	put_u32(1);
+	put_cstring(name);
+	put_cstring(name);
+	put_u32(0);
+	send_packet();
+}
+
+/* --- handles --- */
+
+static int handle_new(int type, int fd, int append, DIR *dir, const char *path) {
+	int i;
+	for (i = 0; i < SFTP_MAX_HANDLES; i++) {
+		if (handles[i].type == HANDLE_UNUSED) {
+			handles[i].type = type;
+			handles[i].fd = fd;
+			handles[i].append = append;
+			handles[i].dir = dir;
+			handles[i].path = strdup(path);
+			if (handles[i].path == NULL) {
+				fatal("out of memory");
+			}
+			handles[i].bytes_read = 0;
+			handles[i].bytes_write = 0;
+			return i;
+		}
+	}
+	return -1;
+}
+
+/* returns the handle or NULL if invalid or not of the wanted type
+ * (HANDLE_UNUSED accepts either type) */
+static struct sftp_handle *get_handle(struct sftp_in *in, int type) {
+	uint32_t len, h;
+	const unsigned char *p = get_string(in, &len);
+	if (p == NULL || len != 4) {
+		return NULL;
+	}
+	h = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+		| ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+	if (h >= SFTP_MAX_HANDLES || handles[h].type == HANDLE_UNUSED) {
+		return NULL;
+	}
+	if (type != HANDLE_UNUSED && handles[h].type != type) {
+		return NULL;
+	}
+	return &handles[h];
+}
+
+static int handle_fd(const struct sftp_handle *h) {
+	return h->type == HANDLE_DIR ? dirfd(h->dir) : h->fd;
+}
+
+static int handle_close(struct sftp_handle *h) {
+	int ret;
+	if (h->type == HANDLE_DIR) {
+		ret = closedir(h->dir);
+	} else {
+		ret = close(h->fd);
+#if SFTP_LOG_OPS
+		sftp_log(LOG_INFO, "sftp user %s: close \"%s\" bytes read %llu written %llu",
+				sftp_user, logpath(h->path),
+				(unsigned long long)h->bytes_read,
+				(unsigned long long)h->bytes_write);
+#endif
+	}
+	free(h->path);
+	memset(h, 0, sizeof(*h));
+	h->fd = -1;
+	return ret;
+}
+
+/* --- setting attributes --- */
+
+static int apply_attrs(int fd, const char *path, const struct sftp_attrs *a) {
+	if (a->flags & SSH_FILEXFER_ATTR_SIZE) {
+		if (a->size > (uint64_t)INT64_MAX) {
+			errno = EINVAL;
+			return -1;
+		}
+		if ((fd >= 0 ? ftruncate(fd, (off_t)a->size) : truncate(path, (off_t)a->size)) < 0) {
+			return -1;
+		}
+	}
+	if (a->flags & SSH_FILEXFER_ATTR_PERMISSIONS) {
+		mode_t mode = (mode_t)(a->perm & SFTP_MODE_MASK);
+		if ((fd >= 0 ? fchmod(fd, mode) : chmod(path, mode)) < 0) {
+			return -1;
+		}
+	}
+	if (a->flags & SSH_FILEXFER_ATTR_ACMODTIME) {
+		struct timespec ts[2];
+		ts[0].tv_sec = (time_t)a->atime;
+		ts[0].tv_nsec = 0;
+		ts[1].tv_sec = (time_t)a->mtime;
+		ts[1].tv_nsec = 0;
+		if ((fd >= 0 ? futimens(fd, ts) : utimensat(AT_FDCWD, path, ts, 0)) < 0) {
+			return -1;
+		}
+	}
+	if (a->flags & SSH_FILEXFER_ATTR_UIDGID) {
+		if ((fd >= 0 ? fchown(fd, (uid_t)a->uid, (gid_t)a->gid)
+				: chown(path, (uid_t)a->uid, (gid_t)a->gid)) < 0) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* --- ls -l style long name for READDIR --- */
+
+static void mode_string(mode_t m, char *s) {
+	switch (m & S_IFMT) {
+		case S_IFDIR: s[0] = 'd'; break;
+		case S_IFLNK: s[0] = 'l'; break;
+		case S_IFCHR: s[0] = 'c'; break;
+		case S_IFBLK: s[0] = 'b'; break;
+		case S_IFIFO: s[0] = 'p'; break;
+		case S_IFSOCK: s[0] = 's'; break;
+		default: s[0] = '-'; break;
+	}
+	s[1] = (m & S_IRUSR) ? 'r' : '-';
+	s[2] = (m & S_IWUSR) ? 'w' : '-';
+	s[3] = (m & S_ISUID) ? ((m & S_IXUSR) ? 's' : 'S') : ((m & S_IXUSR) ? 'x' : '-');
+	s[4] = (m & S_IRGRP) ? 'r' : '-';
+	s[5] = (m & S_IWGRP) ? 'w' : '-';
+	s[6] = (m & S_ISGID) ? ((m & S_IXGRP) ? 's' : 'S') : ((m & S_IXGRP) ? 'x' : '-');
+	s[7] = (m & S_IROTH) ? 'r' : '-';
+	s[8] = (m & S_IWOTH) ? 'w' : '-';
+	s[9] = (m & S_ISVTX) ? ((m & S_IXOTH) ? 't' : 'T') : ((m & S_IXOTH) ? 'x' : '-');
+	s[10] = '\0';
+}
+
+/* owners are numeric: inside a chroot there is no passwd/group */
+static void long_name(char *buf, size_t len, const char *name, const struct stat *st) {
+	char mode[11], tbuf[16];
+	struct tm *tm;
+	time_t now = time(NULL);
+	mode_string(st->st_mode, mode);
+	tbuf[0] = '\0';
+	tm = localtime(&st->st_mtime);
+	if (tm != NULL) {
+		/* recent: month day time, otherwise month day year */
+		if (st->st_mtime > now - (365 * 24 * 60 * 60) / 2
+				&& st->st_mtime < now + (365 * 24 * 60 * 60) / 2) {
+			strftime(tbuf, sizeof(tbuf), "%b %e %H:%M", tm);
+		} else {
+			strftime(tbuf, sizeof(tbuf), "%b %e  %Y", tm);
+		}
+	}
+	snprintf(buf, len, "%s %3u %-8u %-8u %8llu %s %s", mode,
+			(unsigned)st->st_nlink, (unsigned)st->st_uid, (unsigned)st->st_gid,
+			(unsigned long long)st->st_size, tbuf, name);
+}
+
+/* --- request handlers --- */
+
+static void do_open(uint32_t id, struct sftp_in *in) {
+	char *path = get_cstring(in);
+	uint32_t pflags = get_u32(in);
+	struct sftp_attrs a;
+	int flags, fd, h;
+	mode_t mode;
+
+	get_attrs(in, &a);
+	if (in->bad) {
+		goto out;
+	}
+
+	if ((pflags & SSH_FXF_READ) && (pflags & SSH_FXF_WRITE)) {
+		flags = O_RDWR;
+	} else if (pflags & SSH_FXF_WRITE) {
+		flags = O_WRONLY;
+	} else {
+		flags = O_RDONLY;
+	}
+	if (pflags & SSH_FXF_APPEND) {
+		flags |= O_APPEND;
+	}
+	if (pflags & SSH_FXF_CREAT) {
+		flags |= O_CREAT;
+	}
+	if (pflags & SSH_FXF_TRUNC) {
+		flags |= O_TRUNC;
+	}
+	if (pflags & SSH_FXF_EXCL) {
+		flags |= O_EXCL;
+	}
+	mode = (a.flags & SSH_FILEXFER_ATTR_PERMISSIONS)
+		? (mode_t)(a.perm & SFTP_MODE_MASK) : 0666;
+
+	/* O_NONBLOCK so a FIFO can't hang us, cleared again below */
+	fd = open(path, flags | O_NONBLOCK | O_NOCTTY, mode);
+	if (fd < 0) {
+		send_errno(id, errno);
+		goto out;
+	}
+	if (fcntl(fd, F_SETFL, flags & O_APPEND) < 0) {
+		send_errno(id, errno);
+		close(fd);
+		goto out;
+	}
+	h = handle_new(HANDLE_FILE, fd, (pflags & SSH_FXF_APPEND) != 0, NULL, path);
+	if (h < 0) {
+		close(fd);
+		send_status(id, SSH_FX_FAILURE, "Too many open handles");
+		goto out;
+	}
+#if SFTP_LOG_OPS
+	sftp_log(LOG_INFO, "sftp user %s: open \"%s\" flags %s%s%s%s%s%s mode 0%o",
+			sftp_user, logpath(path),
+			(pflags & SSH_FXF_READ) ? "READ" : "",
+			(pflags & SSH_FXF_WRITE) ? ",WRITE" : "",
+			(pflags & SSH_FXF_APPEND) ? ",APPEND" : "",
+			(pflags & SSH_FXF_CREAT) ? ",CREATE" : "",
+			(pflags & SSH_FXF_TRUNC) ? ",TRUNCATE" : "",
+			(pflags & SSH_FXF_EXCL) ? ",EXCL" : "",
+			(unsigned)mode);
+#endif
+	send_handle(id, (uint32_t)h);
+out:
+	free(path);
+}
+
+static void do_close(uint32_t id, struct sftp_in *in) {
+	struct sftp_handle *h = get_handle(in, HANDLE_UNUSED);
+	if (in->bad) {
+		return;
+	}
+	if (h == NULL) {
+		send_status(id, SSH_FX_FAILURE, "Invalid handle");
+		return;
+	}
+	send_result(id, handle_close(h));
+}
+
+static void do_read(uint32_t id, struct sftp_in *in) {
+	struct sftp_handle *h = get_handle(in, HANDLE_FILE);
+	uint64_t off = get_u64(in);
+	uint32_t len = get_u32(in);
+	size_t datapos;
+	ssize_t n;
+
+	if (in->bad) {
+		return;
+	}
+	if (h == NULL) {
+		send_status(id, SSH_FX_FAILURE, "Invalid handle");
+		return;
+	}
+	if (off > (uint64_t)INT64_MAX) {
+		send_status(id, SSH_FX_EOF, NULL);
+		return;
+	}
+	if (len > SFTP_MAX_RW_LEN) {
+		len = SFTP_MAX_RW_LEN;
+	}
+
+	begin_packet(SSH_FXP_DATA, id);
+	put_u32(0); /* data length, filled in below */
+	datapos = out.len;
+	out_reserve(len);
+	do {
+		n = pread(h->fd, out.data + datapos, len, (off_t)off);
+	} while (n < 0 && errno == EINTR);
+	if (n < 0) {
+		send_errno(id, errno);
+		return;
+	}
+	if (n == 0) {
+		send_status(id, SSH_FX_EOF, NULL);
+		return;
+	}
+	out.len = datapos + (size_t)n;
+	out.data[datapos - 4] = (unsigned char)((uint32_t)n >> 24);
+	out.data[datapos - 3] = (unsigned char)((uint32_t)n >> 16);
+	out.data[datapos - 2] = (unsigned char)((uint32_t)n >> 8);
+	out.data[datapos - 1] = (unsigned char)n;
+	h->bytes_read += (uint64_t)n;
+	total_read += (uint64_t)n;
+	send_packet();
+}
+
+static void do_write(uint32_t id, struct sftp_in *in) {
+	struct sftp_handle *h = get_handle(in, HANDLE_FILE);
+	uint64_t off = get_u64(in);
+	uint32_t len;
+	const unsigned char *data = get_string(in, &len);
+
+	if (in->bad) {
+		return;
+	}
+	if (h == NULL) {
+		send_status(id, SSH_FX_FAILURE, "Invalid handle");
+		return;
+	}
+	if (off > (uint64_t)INT64_MAX - len) {
+		send_errno(id, EFBIG);
+		return;
+	}
+	while (len > 0) {
+		/* Linux pwrite() ignores the offset on O_APPEND files, so append
+		 * handles use write() and the data lands at the end like a
+		 * client in append mode expects */
+		ssize_t n = h->append ? write(h->fd, data, len)
+			: pwrite(h->fd, data, len, (off_t)off);
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			send_errno(id, errno);
+			return;
+		}
+		data += n;
+		len -= (uint32_t)n;
+		off += (uint64_t)n;
+		h->bytes_write += (uint64_t)n;
+		total_write += (uint64_t)n;
+	}
+	send_status(id, SSH_FX_OK, NULL);
+}
+
+static void do_stat(uint32_t id, struct sftp_in *in, int follow) {
+	char *path = get_cstring(in);
+	struct stat st;
+
+	if (in->bad) {
+		return;
+	}
+	/* SFTP v3 STAT/LSTAT have no flags field, nothing more to read */
+	if ((follow ? stat(path, &st) : lstat(path, &st)) < 0) {
+		send_errno(id, errno);
+	} else {
+		send_attrs(id, &st);
+	}
+	free(path);
+}
+
+static void do_fstat(uint32_t id, struct sftp_in *in) {
+	struct sftp_handle *h = get_handle(in, HANDLE_UNUSED);
+	struct stat st;
+
+	if (in->bad) {
+		return;
+	}
+	if (h == NULL) {
+		send_status(id, SSH_FX_FAILURE, "Invalid handle");
+	} else if (fstat(handle_fd(h), &st) < 0) {
+		send_errno(id, errno);
+	} else {
+		send_attrs(id, &st);
+	}
+}
+
+static void do_setstat(uint32_t id, struct sftp_in *in) {
+	char *path = get_cstring(in);
+	struct sftp_attrs a;
+
+	get_attrs(in, &a);
+	if (!in->bad) {
+#if SFTP_LOG_OPS
+		sftp_log(LOG_INFO, "sftp user %s: setstat \"%s\"", sftp_user, logpath(path));
+#endif
+		send_result(id, apply_attrs(-1, path, &a));
+	}
+	free(path);
+}
+
+static void do_fsetstat(uint32_t id, struct sftp_in *in) {
+	struct sftp_handle *h = get_handle(in, HANDLE_UNUSED);
+	struct sftp_attrs a;
+
+	get_attrs(in, &a);
+	if (in->bad) {
+		return;
+	}
+	if (h == NULL) {
+		send_status(id, SSH_FX_FAILURE, "Invalid handle");
+		return;
+	}
+	send_result(id, apply_attrs(handle_fd(h), h->path, &a));
+}
+
+static void do_opendir(uint32_t id, struct sftp_in *in) {
+	char *path = get_cstring(in);
+	DIR *dir;
+	int h;
+
+	if (in->bad) {
+		return;
+	}
+	dir = opendir(path);
+	if (dir == NULL) {
+		send_errno(id, errno);
+	} else if ((h = handle_new(HANDLE_DIR, -1, 0, dir, path)) < 0) {
+		closedir(dir);
+		send_status(id, SSH_FX_FAILURE, "Too many open handles");
+	} else {
+		send_handle(id, (uint32_t)h);
+	}
+	free(path);
+}
+
+static void do_readdir(uint32_t id, struct sftp_in *in) {
+	struct sftp_handle *h = get_handle(in, HANDLE_DIR);
+	struct dirent *de;
+	struct stat st;
+	char lname[1024];
+	size_t countpos;
+	uint32_t count = 0;
+
+	if (in->bad) {
+		return;
+	}
+	if (h == NULL) {
+		send_status(id, SSH_FX_FAILURE, "Invalid handle");
+		return;
+	}
+
+	begin_packet(SSH_FXP_NAME, id);
+	countpos = out.len;
+	put_u32(0);
+	while (count < SFTP_READDIR_BATCH) {
+		errno = 0;
+		de = readdir(h->dir);
+		if (de == NULL) {
+			break;
+		}
+		if (fstatat(dirfd(h->dir), de->d_name, &st, AT_SYMLINK_NOFOLLOW) < 0) {
+			continue;
+		}
+		long_name(lname, sizeof(lname), de->d_name, &st);
+		put_cstring(de->d_name);
+		put_cstring(lname);
+		put_attrs(&st);
+		count++;
+	}
+	if (count == 0) {
+		if (errno != 0) {
+			send_errno(id, errno);
+		} else {
+			send_status(id, SSH_FX_EOF, NULL);
+		}
+		return;
+	}
+	out.data[countpos] = (unsigned char)(count >> 24);
+	out.data[countpos + 1] = (unsigned char)(count >> 16);
+	out.data[countpos + 2] = (unsigned char)(count >> 8);
+	out.data[countpos + 3] = (unsigned char)count;
+	send_packet();
+}
+
+static void do_remove(uint32_t id, struct sftp_in *in) {
+	char *path = get_cstring(in);
+	if (in->bad) {
+		return;
+	}
+#if SFTP_LOG_OPS
+	sftp_log(LOG_INFO, "sftp user %s: remove \"%s\"", sftp_user, logpath(path));
+#endif
+	send_result(id, unlink(path));
+	free(path);
+}
+
+static void do_mkdir(uint32_t id, struct sftp_in *in) {
+	char *path = get_cstring(in);
+	struct sftp_attrs a;
+	mode_t mode;
+
+	get_attrs(in, &a);
+	if (!in->bad) {
+		mode = (a.flags & SSH_FILEXFER_ATTR_PERMISSIONS)
+			? (mode_t)(a.perm & SFTP_MODE_MASK) : 0777;
+#if SFTP_LOG_OPS
+		sftp_log(LOG_INFO, "sftp user %s: mkdir \"%s\" mode 0%o",
+				sftp_user, logpath(path), (unsigned)mode);
+#endif
+		send_result(id, mkdir(path, mode));
+	}
+	free(path);
+}
+
+static void do_rmdir(uint32_t id, struct sftp_in *in) {
+	char *path = get_cstring(in);
+	if (in->bad) {
+		return;
+	}
+#if SFTP_LOG_OPS
+	sftp_log(LOG_INFO, "sftp user %s: rmdir \"%s\"", sftp_user, logpath(path));
+#endif
+	send_result(id, rmdir(path));
+	free(path);
+}
+
+/* realpath() that tolerates a missing last path component, like OpenSSH
+ * sftp-server's sftp_realpath(). The sftp client relies on this for
+ * "put -r" into a directory it is about to create. */
+static int sftp_realpath(const char *path, char *resolved) {
+	char parent[PATH_MAX];
+	const char *base = NULL;
+	size_t plen, blen;
+
+	if (realpath(path, resolved) != NULL) {
+		return 0;
+	}
+	if (errno != ENOENT) {
+		return -1;
+	}
+	base = strrchr(path, '/');
+	if (base == NULL) {
+		strcpy(parent, ".");
+		base = path;
+	} else {
+		plen = (size_t)(base - path);
+		if (plen == 0) {
+			plen = 1; /* "/x" */
+		}
+		if (plen >= sizeof(parent)) {
+			errno = ENAMETOOLONG;
+			return -1;
+		}
+		memcpy(parent, path, plen);
+		parent[plen] = '\0';
+		base++;
+	}
+	blen = strlen(base);
+	if (blen == 0 || strcmp(base, ".") == 0 || strcmp(base, "..") == 0) {
+		errno = ENOENT;
+		return -1;
+	}
+	if (realpath(parent, resolved) == NULL) {
+		return -1;
+	}
+	plen = strlen(resolved);
+	if (plen + 1 + blen >= PATH_MAX) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	if (resolved[plen - 1] != '/') {
+		resolved[plen++] = '/';
+	}
+	memcpy(resolved + plen, base, blen + 1);
+	return 0;
+}
+
+static void do_realpath(uint32_t id, struct sftp_in *in) {
+	char *path = get_cstring(in);
+	char resolved[PATH_MAX];
+
+	if (in->bad) {
+		return;
+	}
+	if (path[0] == '\0') {
+		free(path);
+		path = strdup(".");
+		if (path == NULL) {
+			fatal("out of memory");
+		}
+	}
+	if (sftp_realpath(path, resolved) < 0) {
+		send_errno(id, errno);
+	} else {
+		send_name(id, resolved);
+	}
+	free(path);
+}
+
+/* SFTP v3 rename must not overwrite an existing target */
+static int rename_noreplace(const char *oldpath, const char *newpath) {
+	struct stat st;
+
+	if (lstat(oldpath, &st) < 0) {
+		return -1;
+	}
+	if (S_ISREG(st.st_mode)) {
+		/* link() fails atomically if the target exists */
+		if (link(oldpath, newpath) == 0) {
+			if (unlink(oldpath) < 0) {
+				int e = errno;
+				unlink(newpath);
+				errno = e;
+				return -1;
+			}
+			return 0;
+		}
+		if (errno != EOPNOTSUPP && errno != ENOSYS && errno != EXDEV
+				&& errno != EPERM && errno != EMLINK) {
+			return -1;
+		}
+	}
+	/* not a regular file, or the filesystem has no hard links */
+	if (lstat(newpath, &st) == 0) {
+		errno = EEXIST;
+		return -1;
+	}
+	return rename(oldpath, newpath);
+}
+
+static void do_rename(uint32_t id, struct sftp_in *in, int posix) {
+	char *oldpath = get_cstring(in);
+	char *newpath = get_cstring(in);
+
+	if (!in->bad) {
+#if SFTP_LOG_OPS
+		sftp_log(LOG_INFO, "sftp user %s: %s \"%s\"", sftp_user,
+				posix ? "posix-rename" : "rename", logpath(oldpath));
+		sftp_log(LOG_INFO, "sftp user %s:   to \"%s\"", sftp_user, logpath(newpath));
+#endif
+		send_result(id, posix ? rename(oldpath, newpath)
+				: rename_noreplace(oldpath, newpath));
+	}
+	free(oldpath);
+	free(newpath);
+}
+
+static void do_readlink(uint32_t id, struct sftp_in *in) {
+	char *path = get_cstring(in);
+	char buf[PATH_MAX];
+	ssize_t n;
+
+	if (in->bad) {
+		return;
+	}
+	n = readlink(path, buf, sizeof(buf) - 1);
+	if (n < 0) {
+		send_errno(id, errno);
+	} else {
+		buf[n] = '\0';
+		send_name(id, buf);
+	}
+	free(path);
+}
+
+static void do_symlink(uint32_t id, struct sftp_in *in) {
+	/* OpenSSH sends the target first, then the link path (the
+	 * reverse of the draft). All common clients follow OpenSSH. */
+	char *target = get_cstring(in);
+	char *linkpath = get_cstring(in);
+
+	if (!in->bad) {
+#if SFTP_LOG_OPS
+		sftp_log(LOG_INFO, "sftp user %s: symlink \"%s\"", sftp_user, logpath(linkpath));
+#endif
+		send_result(id, symlink(target, linkpath));
+	}
+	free(target);
+	free(linkpath);
+}
+
+static void send_statvfs(uint32_t id, const struct statvfs *st) {
+	uint64_t flag = 0;
+	if (st->f_flag & ST_RDONLY) {
+		flag |= SSH2_FXE_STATVFS_ST_RDONLY;
+	}
+	if (st->f_flag & ST_NOSUID) {
+		flag |= SSH2_FXE_STATVFS_ST_NOSUID;
+	}
+	begin_packet(SSH_FXP_EXTENDED_REPLY, id);
+	put_u64((uint64_t)st->f_bsize);
+	put_u64((uint64_t)st->f_frsize);
+	put_u64((uint64_t)st->f_blocks);
+	put_u64((uint64_t)st->f_bfree);
+	put_u64((uint64_t)st->f_bavail);
+	put_u64((uint64_t)st->f_files);
+	put_u64((uint64_t)st->f_ffree);
+	put_u64((uint64_t)st->f_favail);
+	put_u64((uint64_t)st->f_fsid);
+	put_u64(flag);
+	put_u64((uint64_t)st->f_namemax);
+	send_packet();
+}
+
+static void do_extended(uint32_t id, struct sftp_in *in) {
+	uint32_t len;
+	const unsigned char *p = get_string(in, &len);
+	char name[64];
+
+	if (in->bad) {
+		return;
+	}
+	if (len >= sizeof(name)) {
+		send_status(id, SSH_FX_OP_UNSUPPORTED, NULL);
+		return;
+	}
+	memcpy(name, p, len);
+	name[len] = '\0';
+
+	if (strcmp(name, "posix-rename@openssh.com") == 0) {
+		do_rename(id, in, 1);
+	} else if (strcmp(name, "statvfs@openssh.com") == 0) {
+		char *path = get_cstring(in);
+		struct statvfs st;
+		if (in->bad) {
+			return;
+		}
+		if (statvfs(path, &st) < 0) {
+			send_errno(id, errno);
+		} else {
+			send_statvfs(id, &st);
+		}
+		free(path);
+	} else if (strcmp(name, "fstatvfs@openssh.com") == 0) {
+		struct sftp_handle *h = get_handle(in, HANDLE_UNUSED);
+		struct statvfs st;
+		if (in->bad) {
+			return;
+		}
+		if (h == NULL) {
+			send_status(id, SSH_FX_FAILURE, "Invalid handle");
+		} else if (fstatvfs(handle_fd(h), &st) < 0) {
+			send_errno(id, errno);
+		} else {
+			send_statvfs(id, &st);
+		}
+	} else if (strcmp(name, "hardlink@openssh.com") == 0) {
+		char *oldpath = get_cstring(in);
+		char *newpath = get_cstring(in);
+		if (!in->bad) {
+#if SFTP_LOG_OPS
+			sftp_log(LOG_INFO, "sftp user %s: hardlink \"%s\"", sftp_user, logpath(newpath));
+#endif
+			send_result(id, link(oldpath, newpath));
+		}
+		free(oldpath);
+		free(newpath);
+	} else if (strcmp(name, "fsync@openssh.com") == 0) {
+		struct sftp_handle *h = get_handle(in, HANDLE_FILE);
+		if (in->bad) {
+			return;
+		}
+		if (h == NULL) {
+			send_status(id, SSH_FX_FAILURE, "Invalid handle");
+		} else {
+			send_result(id, fsync(h->fd));
+		}
+	} else if (strcmp(name, "limits@openssh.com") == 0) {
+		begin_packet(SSH_FXP_EXTENDED_REPLY, id);
+		put_u64(SFTP_MAX_MSG_LEN);
+		put_u64(SFTP_MAX_RW_LEN);
+		put_u64(SFTP_MAX_RW_LEN);
+		put_u64(SFTP_MAX_HANDLES);
+		send_packet();
+	} else {
+		send_status(id, SSH_FX_OP_UNSUPPORTED, NULL);
+	}
+}
+
+static void send_version(void) {
+	out.len = 0;
+	put_u32(0);
+	put_u8(SSH_FXP_VERSION);
+	put_u32(SFTP_VERSION);
+	put_cstring("posix-rename@openssh.com");
+	put_cstring("1");
+	put_cstring("statvfs@openssh.com");
+	put_cstring("2");
+	put_cstring("fstatvfs@openssh.com");
+	put_cstring("2");
+	put_cstring("hardlink@openssh.com");
+	put_cstring("1");
+	put_cstring("fsync@openssh.com");
+	put_cstring("1");
+	put_cstring("limits@openssh.com");
+	put_cstring("1");
+	send_packet();
+}
+
+/* --- main loop --- */
+
+/* returns 0 on clean EOF before any data, exits on errors */
+static int read_full(int fd, unsigned char *buf, size_t len) {
+	size_t done = 0;
+	while (done < len) {
+		ssize_t n = read(fd, buf + done, len - done);
+		if (n < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			fatal("read error");
+		}
+		if (n == 0) {
+			if (done == 0) {
+				return 0;
+			}
+			fatal("truncated packet");
+		}
+		done += (size_t)n;
+	}
+	return 1;
+}
+
+int sftp_server_main(int infd, int outfd, const char *user) {
+	unsigned char *buf;
+	unsigned char lenbuf[4];
+	int initialized = 0;
+	int i;
+
+	sftp_outfd = outfd;
+	sftp_user = user;
+	for (i = 0; i < SFTP_MAX_HANDLES; i++) {
+		handles[i].fd = -1;
+	}
+	buf = malloc(SFTP_MAX_MSG_LEN);
+	if (buf == NULL) {
+		fatal("out of memory");
+	}
+	sftp_log(LOG_INFO, "sftp session opened for user %s", user);
+
+	for (;;) {
+		struct sftp_in in;
+		uint32_t len, type, id;
+
+		if (!read_full(infd, lenbuf, 4)) {
+			break; /* EOF */
+		}
+		len = ((uint32_t)lenbuf[0] << 24) | ((uint32_t)lenbuf[1] << 16)
+			| ((uint32_t)lenbuf[2] << 8) | (uint32_t)lenbuf[3];
+		if (len < 1 || len > SFTP_MAX_MSG_LEN) {
+			fatal("bad packet length");
+		}
+		if (!read_full(infd, buf, len)) {
+			fatal("truncated packet");
+		}
+
+		in.data = buf;
+		in.len = len;
+		in.pos = 0;
+		in.bad = 0;
+		type = get_u8(&in);
+
+		if (!initialized) {
+			if (type != SSH_FXP_INIT) {
+				fatal("expected SSH_FXP_INIT");
+			}
+			(void)get_u32(&in); /* client version, we only do 3 */
+			send_version();
+			initialized = 1;
+			continue;
+		}
+
+		id = get_u32(&in);
+		if (in.bad) {
+			fatal("bad packet");
+		}
+
+		switch (type) {
+			case SSH_FXP_OPEN: do_open(id, &in); break;
+			case SSH_FXP_CLOSE: do_close(id, &in); break;
+			case SSH_FXP_READ: do_read(id, &in); break;
+			case SSH_FXP_WRITE: do_write(id, &in); break;
+			case SSH_FXP_LSTAT: do_stat(id, &in, 0); break;
+			case SSH_FXP_FSTAT: do_fstat(id, &in); break;
+			case SSH_FXP_SETSTAT: do_setstat(id, &in); break;
+			case SSH_FXP_FSETSTAT: do_fsetstat(id, &in); break;
+			case SSH_FXP_OPENDIR: do_opendir(id, &in); break;
+			case SSH_FXP_READDIR: do_readdir(id, &in); break;
+			case SSH_FXP_REMOVE: do_remove(id, &in); break;
+			case SSH_FXP_MKDIR: do_mkdir(id, &in); break;
+			case SSH_FXP_RMDIR: do_rmdir(id, &in); break;
+			case SSH_FXP_REALPATH: do_realpath(id, &in); break;
+			case SSH_FXP_STAT: do_stat(id, &in, 1); break;
+			case SSH_FXP_RENAME: do_rename(id, &in, 0); break;
+			case SSH_FXP_READLINK: do_readlink(id, &in); break;
+			case SSH_FXP_SYMLINK: do_symlink(id, &in); break;
+			case SSH_FXP_EXTENDED: do_extended(id, &in); break;
+			default:
+				send_status(id, SSH_FX_OP_UNSUPPORTED, NULL);
+				break;
+		}
+		if (in.bad) {
+			fatal("bad packet");
+		}
+	}
+
+	for (i = 0; i < SFTP_MAX_HANDLES; i++) {
+		if (handles[i].type != HANDLE_UNUSED) {
+			handle_close(&handles[i]);
+		}
+	}
+	free(buf);
+	free(out.data);
+	return 0;
+}
+
+#ifndef SFTP_STANDALONE
+
+/* keep AF_UNIX sockets (the syslog socket, opened before the chroot) */
+static int is_unix_socket(int fd) {
+	struct sockaddr_storage ss;
+	socklen_t len = sizeof(ss);
+	if (getsockname(fd, (struct sockaddr *)&ss, &len) < 0) {
+		return 0;
+	}
+	return ss.ss_family == AF_UNIX;
+}
+
+/* Runs in the forked session child with stdin/stdout connected to the
+ * channel, after the user switch. The hostkey and prng state have already
+ * been wiped by execchild(). */
+void svr_sftp_internal(void) {
+	unsigned int i;
+
+	/* the session keys aren't needed in this process */
+	if (ses.keys) {
+		m_burn(ses.keys, sizeof(*ses.keys));
+	}
+	if (ses.newkeys) {
+		m_burn(ses.newkeys, sizeof(*ses.newkeys));
+	}
+
+	/* close the network socket and other channels' fds, like
+	 * run_command() does before exec */
+	for (i = 3; i <= ses.maxfd; i++) {
+		if (!is_unix_socket(i)) {
+			m_close(i);
+		}
+	}
+
+	sftp_exit(sftp_server_main(STDIN_FILENO, STDOUT_FILENO, ses.authstate.pw_name));
+}
+
+#endif /* !SFTP_STANDALONE */
+
+#endif /* SFTP_STANDALONE || DROPBEAR_SFTP_INTERNAL */
